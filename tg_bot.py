@@ -106,7 +106,7 @@ def get_user_keyboard(is_admin: bool):
 # ================= ЛОГИКА БОТА =================
 router = Router()
 
-# ЛОВИМ ЧАТЫ АВТОМАТИЧЕСКИ (любое сообщение в группе сохраняет чат в базу)
+# Автоматический сбор чатов для автопиара
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def capture_groups(message: Message):
     db = load_data()
@@ -114,7 +114,6 @@ async def capture_groups(message: Message):
     if chat_id not in db["chats"]:
         db["chats"].append(chat_id)
         save_data(db)
-        print(f"➕ Автоматически добавлен чат в базу: {chat_id}")
 
 @router.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: Message):
@@ -127,7 +126,7 @@ async def cmd_start(message: Message):
     is_admin = (user_id == db["owner"]) or (user_id in db["admins"])
     await message.answer(db["welcome_text"], reply_markup=get_user_keyboard(is_admin))
 
-# Обработка личных сообщений и админки
+# Обработка личных сообщений
 @router.message(F.chat.type == "private")
 async def handle_private(message: Message, state: FSMContext):
     db = load_data()
@@ -141,9 +140,55 @@ async def handle_private(message: Message, state: FSMContext):
     is_owner = (user_id == db["owner"])
     is_admin = is_owner or (user_id in db["admins"])
 
+    # 1. ОБРАБОТКА ОТВЕТОВ АДМИНА ЧЕРЕЗ REPLY (СИСТЕМА ТИКЕТОВ)
+    if is_admin and message.reply_to_message:
+        replied_text = message.reply_to_message.text or ""
+        # Ищем ID покупателя в тексте сообщения, на которое ответил админ
+        if "ID покупателя:" in replied_text:
+            try:
+                # Достаем ID из текста сообщения
+                lines = replied_text.split("\n")
+                target_id = None
+                for line in lines:
+                    if "ID покупателя:" in line:
+                        target_id = int(line.split("ID покупателя:")[1].strip())
+                        break
+                
+                if target_id:
+                    await message.bot.send_message(
+                        target_id, 
+                        f"💬 **Ответ от администратора:**\n\n{text}", 
+                        parse_mode="Markdown"
+                    )
+                    await message.answer("✅ Ответ успешно отправлен покупателю!")
+                    return
+            except Exception as e:
+                print(f"Ошибка отправки ответа клиенту: {e}")
+
+    # 2. ЕСЛИ ПОКУПАТЕЛЬ ПИШЕТ В ЛС БОТУ (КОГДА ОН НЕ АДМИН И НЕТ СОСТОЯНИЙ)
+    if not is_admin and not await state.get_state():
+        # Пересылаем сообщение клиента всем админам, чтобы они могли ответить через Reply
+        user_link = f"@{message.from_user.username}" if message.from_user.username else f"tg://user?id={user_id}"
+        forward_text = (
+            "💬 **СООБЩЕНИЕ ОТ КЛИЕНТА:**\n"
+            f"👤 Пользователь: {message.from_user.full_name} ({user_link})\n"
+            f"🆔 ID покупателя: {user_id}\n\n"
+            f"✍️ Текст: {text}\n\n"
+            "👉 *Чтобы ответить, просто сделайте Reply (Ответить) на это сообщение!*"
+        )
+        for aid in db["admins"]:
+            try:
+                await message.bot.send_message(aid, forward_text, parse_mode="Markdown")
+            except:
+                pass
+        
+        await message.answer("📩 Ваше сообщение отправлено администрации. Ожидайте ответа!", reply_markup=get_user_keyboard(is_admin))
+        return
+
+    # 3. ПЕРХВАТ СОСТОЯНИЙ АДМИНА (ВВОД ТЕКСТОВ / АДМИНОВ)
     current_state = await state.get_state()
     if current_state and is_admin:
-        if text.lower() == "отмена":
+        if text and text.lower() == "отмена":
             await state.clear()
             await message.answer("❌ Действие отменено.", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
             return
@@ -224,6 +269,7 @@ async def handle_private(message: Message, state: FSMContext):
             await state.clear()
             return
 
+    # 4. ОБРАБОТКА КНОПОК АДМИН-ПАНЕЛИ
     if is_admin:
         if text in ["⚙️ Админ-панель", "админ", "меню"]:
             await message.answer(f"⚙️ АДМИН-ПАНЕЛЬ\n\n💬 Чатов с пиаром: {len(db['chats'])}\n👥 Юзеров в ЛС: {len(db['users'])}\n⚡ Статус пиара: {'🟢 Вкл' if db['is_active'] else '🔴 Выкл'}", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
@@ -283,15 +329,25 @@ async def handle_private(message: Message, state: FSMContext):
                 await message.answer(f"👑 Владелец ID: {db['owner']}\n\n🛡 Админы:\n{lst}", reply_markup=get_admin_keyboard(db["is_active"], is_owner), parse_mode="Markdown")
                 return
 
+    # 5. ОБРАБОТКА КНОПОК ПОКУПАТЕЛЯ
     if text == "🛒 Прайс-лист / Товары":
         await message.answer(db["price_text"], reply_markup=get_user_keyboard(is_admin))
     elif text == "❓ Как купить / Правила":
         await message.answer(db["helper_text"], reply_markup=get_user_keyboard(is_admin))
     elif text == "📩 Вызвать администратора":
-        await message.answer("📩 Запрос отправлен! Ожидайте ответа.\n⚠️ Работаем строго по 100% предоплате.", reply_markup=get_user_keyboard(is_admin))
+        await message.answer("📩 Запрос отправлен администраторам! Ожидайте ответа.\n⚠️ Работаем строго по 100% предоплате.", reply_markup=get_user_keyboard(is_admin))
+        
+        # Формируем красивую ссылку на пользователя для админов
+        user_link = f"@{message.from_user.username}" if message.from_user.username else f"tg://user?id={user_id}"
+        alert_text = (
+            "🚨 **ВЫЗОВ АДМИНА!**\n"
+            f"👤 Покупатель: {message.from_user.full_name} ({user_link})\n"
+            f"🆔 ID покупателя: {user_id}\n\n"
+            "👉 *Ответьте на это сообщение (Reply), чтобы написать клиенту!*"
+        )
         for aid in db["admins"]:
             try:
-                await message.bot.send_message(aid, f"🚨 ВЫЗОВ АДМИНА!\nПокупатель ID: {user_id}")
+                await message.bot.send_message(aid, alert_text, parse_mode="Markdown")
             except:
                 pass
     else:
@@ -338,7 +394,7 @@ async def main():
     asyncio.create_task(web_server())
     asyncio.create_task(background_autopyar(bot))
 
-    print("🤖 Бот успешно запущен и готов к работе!")
+    print("🤖 Бот с системой тикетов успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
