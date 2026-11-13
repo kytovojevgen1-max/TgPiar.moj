@@ -77,6 +77,7 @@ class AdminStates(StatesGroup):
     add_admin = State()
     remove_admin = State()
     transfer_owner = State()
+    waiting_for_support = State()  # Состояние общения с админом
 
 # ================= КЛАВИАТУРЫ =================
 def get_admin_keyboard(is_active: bool, is_owner: bool):
@@ -116,7 +117,8 @@ async def capture_groups(message: Message):
         save_data(db)
 
 @router.message(Command("start"), F.chat.type == "private")
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()  # Сбрасываем любые зависшие состояния
     db = load_data()
     user_id = message.from_user.id
     if user_id not in db["users"]:
@@ -139,14 +141,13 @@ async def handle_private(message: Message, state: FSMContext):
 
     is_owner = (user_id == db["owner"])
     is_admin = is_owner or (user_id in db["admins"])
+    current_state = await state.get_state()
 
-    # 1. ОБРАБОТКА ОТВЕТОВ АДМИНА ЧЕРЕЗ REPLY (СИСТЕМА ТИКЕТОВ)
+    # 1. ОБРАБОТКА ОТВЕТОВ АДМИНА ЧЕРЕЗ REPLY
     if is_admin and message.reply_to_message:
         replied_text = message.reply_to_message.text or ""
-        # Ищем ID покупателя в тексте сообщения, на которое ответил админ
         if "ID покупателя:" in replied_text:
             try:
-                # Достаем ID из текста сообщения
                 lines = replied_text.split("\n")
                 target_id = None
                 for line in lines:
@@ -165,29 +166,31 @@ async def handle_private(message: Message, state: FSMContext):
             except Exception as e:
                 print(f"Ошибка отправки ответа клиенту: {e}")
 
-    # 2. ЕСЛИ ПОКУПАТЕЛЬ ПИШЕТ В ЛС БОТУ (КОГДА ОН НЕ АДМИН И НЕТ СОСТОЯНИЙ)
-    if not is_admin and not await state.get_state():
-        # Пересылаем сообщение клиента всем админам, чтобы они могли ответить через Reply
-        user_link = f"@{message.from_user.username}" if message.from_user.username else f"tg://user?id={user_id}"
-        forward_text = (
-            "💬 **СООБЩЕНИЕ ОТ КЛИЕНТА:**\n"
-            f"👤 Пользователь: {message.from_user.full_name} ({user_link})\n"
-            f"🆔 ID покупателя: {user_id}\n\n"
-            f"✍️ Текст: {text}\n\n"
-            "👉 *Чтобы ответить, просто сделайте Reply (Ответить) на это сообщение!*"
-        )
-        for aid in db["admins"]:
-            try:
-                await message.bot.send_message(aid, forward_text, parse_mode="Markdown")
-            except:
-                pass
-        
-        await message.answer("📩 Ваше сообщение отправлено администрации. Ожидайте ответа!", reply_markup=get_user_keyboard(is_admin))
-        return
+    # 2. ЕСЛИ ПОЛЬЗОВАТЕЛЬ НАХОДИТСЯ В РЕЖИМЕ ОБЩЕНИЯ С АДМИНОМ (после вызова)
+    if current_state == AdminStates.waiting_for_support.state:
+        if text.lower() == "отмена" or text in ["🛒 Прайс-лист / Товары", "❓ Как купить / Правила", "📩 Вызвать администратора", "⚙️ Админ-панель"]:
+            await state.clear()
+            # Пропускаем дальше, чтобы сработали обычные кнопки
+        else:
+            # Пересылаем сообщение админам
+            user_link = f"@{message.from_user.username}" if message.from_user.username else f"tg://user?id={user_id}"
+            forward_text = (
+                "💬 **СООБЩЕНИЕ ОТ КЛИЕНТА:**\n"
+                f"👤 Пользователь: {message.from_user.full_name} ({user_link})\n"
+                f"🆔 ID покупателя: {user_id}\n\n"
+                f"✍️ Текст: {text}\n\n"
+                "👉 *Чтобы ответить, просто сделайте Reply (Ответить) на это сообщение!*"
+            )
+            for aid in db["admins"]:
+                try:
+                    await message.bot.send_message(aid, forward_text, parse_mode="Markdown")
+                except:
+                    pass
+            await message.answer("📩 Сообщение отправлено админам. Ожидайте ответа или нажмите кнопку меню для выхода.")
+            return
 
     # 3. ПЕРХВАТ СОСТОЯНИЙ АДМИНА (ВВОД ТЕКСТОВ / АДМИНОВ)
-    current_state = await state.get_state()
-    if current_state and is_admin:
+    if current_state and current_state != AdminStates.waiting_for_support.state and is_admin:
         if text and text.lower() == "отмена":
             await state.clear()
             await message.answer("❌ Действие отменено.", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
@@ -331,19 +334,22 @@ async def handle_private(message: Message, state: FSMContext):
 
     # 5. ОБРАБОТКА КНОПОК ПОКУПАТЕЛЯ
     if text == "🛒 Прайс-лист / Товары":
+        await state.clear()
         await message.answer(db["price_text"], reply_markup=get_user_keyboard(is_admin))
     elif text == "❓ Как купить / Правила":
+        await state.clear()
         await message.answer(db["helper_text"], reply_markup=get_user_keyboard(is_admin))
     elif text == "📩 Вызвать администратора":
-        await message.answer("📩 Запрос отправлен администраторам! Ожидайте ответа.\n⚠️ Работаем строго по 100% предоплате.", reply_markup=get_user_keyboard(is_admin))
+        # Переводим пользователя в режим общения с поддержкой
+        await state.set_state(AdminStates.waiting_for_support)
+        await message.answer("📩 Режим связи с администратором активирован!\nНапишите свой вопрос или проблему следующим сообщением, и админ сразу ответит вам.", reply_markup=get_user_keyboard(is_admin))
         
-        # Формируем красивую ссылку на пользователя для админов
         user_link = f"@{message.from_user.username}" if message.from_user.username else f"tg://user?id={user_id}"
         alert_text = (
             "🚨 **ВЫЗОВ АДМИНА!**\n"
             f"👤 Покупатель: {message.from_user.full_name} ({user_link})\n"
             f"🆔 ID покупателя: {user_id}\n\n"
-            "👉 *Ответьте на это сообщение (Reply), чтобы написать клиенту!*"
+            "👉 *Пользователь нажал кнопку вызова. Ответьте на это сообщение (Reply), чтобы написать ему!*"
         )
         for aid in db["admins"]:
             try:
@@ -351,6 +357,7 @@ async def handle_private(message: Message, state: FSMContext):
             except:
                 pass
     else:
+        # Если пользователь просто написал текст, а не нажимал вызов админа
         await message.answer(db["welcome_text"], reply_markup=get_user_keyboard(is_admin))
 
 # ================= АВТОПИАР =================
@@ -394,7 +401,7 @@ async def main():
     asyncio.create_task(web_server())
     asyncio.create_task(background_autopyar(bot))
 
-    print("🤖 Бот с системой тикетов успешно запущен!")
+    print("🤖 Бот успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
