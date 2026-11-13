@@ -67,7 +67,7 @@ def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-# FSM Состояния для редактирования
+# FSM Состояния
 class AdminStates(StatesGroup):
     edit_piar = State()
     edit_price = State()
@@ -103,19 +103,21 @@ def get_user_keyboard(is_admin: bool):
         kb.append([KeyboardButton(text="⚙️ Админ-панель")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# ================= ОСНОВНОЙ ЛОГИКА БОТА =================
+# ================= ЛОГИКА БОТА =================
 router = Router()
 
-@router.message(Command("start"))
-async def cmd_start(message: Message):
-    if message.chat.type != "private":
-        # Если бота добавили в группу/чат
-        db = load_data()
-        if message.chat.id not in db["chats"]:
-            db["chats"].append(message.chat.id)
-            save_data(db)
-        return
+# ЛОВИМ ЧАТЫ АВТОМАТИЧЕСКИ (любое сообщение в группе сохраняет чат в базу)
+@router.message(F.chat.type.in_({"group", "supergroup"}))
+async def capture_groups(message: Message):
+    db = load_data()
+    chat_id = message.chat.id
+    if chat_id not in db["chats"]:
+        db["chats"].append(chat_id)
+        save_data(db)
+        print(f"➕ Автоматически добавлен чат в базу: {chat_id}")
 
+@router.message(Command("start"), F.chat.type == "private")
+async def cmd_start(message: Message):
     db = load_data()
     user_id = message.from_user.id
     if user_id not in db["users"]:
@@ -125,14 +127,13 @@ async def cmd_start(message: Message):
     is_admin = (user_id == db["owner"]) or (user_id in db["admins"])
     await message.answer(db["welcome_text"], reply_markup=get_user_keyboard(is_admin))
 
-# Обработка текстовых кнопок в ЛС
+# Обработка личных сообщений и админки
 @router.message(F.chat.type == "private")
-async def handle_messages(message: Message, state: FSMContext):
+async def handle_private(message: Message, state: FSMContext):
     db = load_data()
     user_id = message.from_user.id
     text = message.text
 
-    # Регистрация пользователя в базе
     if user_id not in db["users"]:
         db["users"].append(user_id)
         save_data(db)
@@ -140,7 +141,6 @@ async def handle_messages(message: Message, state: FSMContext):
     is_owner = (user_id == db["owner"])
     is_admin = is_owner or (user_id in db["admins"])
 
-    # Проверка состояний FSM (ввод текста/админов)
     current_state = await state.get_state()
     if current_state and is_admin:
         if text.lower() == "отмена":
@@ -185,19 +185,16 @@ async def handle_messages(message: Message, state: FSMContext):
             await message.answer(f"✅ Рассылка отправлена {count} пользователям.", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
             return
         elif current_state == AdminStates.add_admin.state and is_owner:
-            target_id = text.strip().replace("@", "")
-            # Поддержка ввода ID или юзернейма
             try:
-                tid = int(target_id)
-            except ValueError:
-                tid = target_id # Если ввели юзернейм (в Телеграме лучше передавать числовой ID)
-            
-            if tid not in db["admins"]:
-                db["admins"].append(tid)
-                save_data(db)
-                await message.answer(f"✅ Администратор {tid} успешно добавлен!", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
-            else:
-                await message.answer("❌ Пользователь уже в списке админов.", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
+                tid = int(text.strip())
+                if tid not in db["admins"]:
+                    db["admins"].append(tid)
+                    save_data(db)
+                    await message.answer(f"✅ Администратор ID: {tid} добавлен!", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
+                else:
+                    await message.answer("❌ Уже в админах.", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
+            except:
+                await message.answer("❌ Неверный ID.", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
             await state.clear()
             return
         elif current_state == AdminStates.remove_admin.state and is_owner:
@@ -206,11 +203,11 @@ async def handle_messages(message: Message, state: FSMContext):
                 if tid in db["admins"] and tid != db["owner"]:
                     db["admins"].remove(tid)
                     save_data(db)
-                    await message.answer(f"✅ Администратор {tid} снят.", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
+                    await message.answer(f"✅ Администратор ID: {tid} снят.", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
                 else:
                     await message.answer("❌ Нельзя снять владельца или неверный ID.", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
             except:
-                await message.answer("❌ Ошибка. Введи числовой Telegram ID.", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
+                await message.answer("❌ Ошибка. Введи ID.", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
             await state.clear()
             return
         elif current_state == AdminStates.transfer_owner.state and is_owner:
@@ -221,16 +218,15 @@ async def handle_messages(message: Message, state: FSMContext):
                     db["admins"].append(tid)
                 save_data(db)
                 new_owner = (user_id == tid)
-                await message.answer(f"👑 Права владельца переданы пользователю ID: {tid}!", reply_markup=get_admin_keyboard(db["is_active"], new_owner))
+                await message.answer(f"👑 Права владельца переданы ID: {tid}!", reply_markup=get_admin_keyboard(db["is_active"], new_owner))
             except:
                 await message.answer("❌ Неверный ID.", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
             await state.clear()
             return
 
-    # Обработка обычных кнопок админ-панели
     if is_admin:
         if text in ["⚙️ Админ-панель", "админ", "меню"]:
-            await message.answer(f"⚙️ ТЕЛЕГРАМ АДМИН-ПАНЕЛЬ\n\n💬 Чатов с пиаром: {len(db['chats'])}\n👥 Юзеров в ЛС: {len(db['users'])}\n⚡ Статус пиара: {'🟢 Вкл' if db['is_active'] else '🔴 Выкл'}", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
+            await message.answer(f"⚙️ АДМИН-ПАНЕЛЬ\n\n💬 Чатов с пиаром: {len(db['chats'])}\n👥 Юзеров в ЛС: {len(db['users'])}\n⚡ Статус пиара: {'🟢 Вкл' if db['is_active'] else '🔴 Выкл'}", reply_markup=get_admin_keyboard(db["is_active"], is_owner))
             return
         elif text == "🔴 Остановить автопиар":
             db["is_active"] = False
@@ -247,23 +243,23 @@ async def handle_messages(message: Message, state: FSMContext):
             return
         elif text == "✏️ Текст автопиара":
             await state.set_state(AdminStates.edit_piar)
-            await message.answer("✍️ Отправь новый текст автопиара для групп (или 'Отмена'):")
+            await message.answer("✍️ Отправь новый текст пиара:")
             return
         elif text == "✏️ Изменить прайс-лист":
             await state.set_state(AdminStates.edit_price)
-            await message.answer("✍️ Отправь новый прайс-лист для ЛС (или 'Отмена'):")
+            await message.answer("✍️ Отправь новый прайс-лист:")
             return
         elif text == "✏️ Автоответ в ЛС":
             await state.set_state(AdminStates.edit_welcome)
-            await message.answer("✍️ Отправь новый приветственный текст (или 'Отмена'):")
+            await message.answer("✍️ Отправь новый приветственный текст:")
             return
         elif text == "✏️ Текст хелпера":
             await state.set_state(AdminStates.edit_helper)
-            await message.answer("✍️ Отправь новые правила покупки (или 'Отмена'):")
+            await message.answer("✍️ Отправь новые правила покупки:")
             return
         elif text == "📢 Рассылка в ЛС":
             await state.set_state(AdminStates.broadcast)
-            await message.answer("📣 Напиши текст для массовой рассылки (или 'Отмена'):")
+            await message.answer("📣 Напиши текст для рассылки:")
             return
         elif text == "🛒 Меню покупателя":
             await message.answer(db["welcome_text"], reply_markup=get_user_keyboard(True))
@@ -272,38 +268,36 @@ async def handle_messages(message: Message, state: FSMContext):
         if is_owner:
             if text == "➕ Выдать админа":
                 await state.set_state(AdminStates.add_admin)
-                await message.answer("👤 Отправь Telegram ID нового администратора (или 'Отмена'):")
+                await message.answer("👤 Отправь Telegram ID нового админа:")
                 return
             elif text == "➖ Снять админа":
                 await state.set_state(AdminStates.remove_admin)
-                await message.answer("👤 Отправь Telegram ID админа для снятия (или 'Отмена'):")
+                await message.answer("👤 Отправь Telegram ID админа для снятия:")
                 return
             elif text == "👑 Передать владельца":
                 await state.set_state(AdminStates.transfer_owner)
-                await message.answer("👑 ВНИМАНИЕ! Отправь Telegram ID нового ВЛАДЕЛЬЦА (или 'Отмена'):")
+                await message.answer("👑 Отправь Telegram ID нового владельца:")
                 return
             elif text == "👥 Список админов":
                 lst = "\n".join([f"• ID: `{a}`" for a in db["admins"]])
-                await message.answer(f"👑 Владелец ID: {db['owner']}\n\n🛡 Администраторы:\n{lst}", reply_markup=get_admin_keyboard(db["is_active"], is_owner), parse_mode="Markdown")
+                await message.answer(f"👑 Владелец ID: {db['owner']}\n\n🛡 Админы:\n{lst}", reply_markup=get_admin_keyboard(db["is_active"], is_owner), parse_mode="Markdown")
                 return
 
-    # Кнопки покупателя
     if text == "🛒 Прайс-лист / Товары":
         await message.answer(db["price_text"], reply_markup=get_user_keyboard(is_admin))
     elif text == "❓ Как купить / Правила":
         await message.answer(db["helper_text"], reply_markup=get_user_keyboard(is_admin))
     elif text == "📩 Вызвать администратора":
-        await message.answer("📩 Запрос отправлен администраторам! Ожидайте ответа.\n⚠️ Работаем строго по 100% предоплате.", reply_markup=get_user_keyboard(is_admin))
+        await message.answer("📩 Запрос отправлен! Ожидайте ответа.\n⚠️ Работаем строго по 100% предоплате.", reply_markup=get_user_keyboard(is_admin))
         for aid in db["admins"]:
             try:
-                username_info = f" (@{message.from_user.username})" if message.from_user.username else ""
-                await message.bot.send_message(aid, f"🚨 ВЫЗОВ АДМИНА!\nПокупатель: tg://user?id={user_id}{username_info} (ID: {user_id})")
+                await message.bot.send_message(aid, f"🚨 ВЫЗОВ АДМИНА!\nПокупатель ID: {user_id}")
             except:
                 pass
     else:
         await message.answer(db["welcome_text"], reply_markup=get_user_keyboard(is_admin))
 
-# ================= ФОНОВЫЙ АВТОПИАР ДЛЯ ТГ =================
+# ================= АВТОПИАР =================
 async def background_autopyar(bot: Bot):
     while True:
         await asyncio.sleep(30)
@@ -319,7 +313,6 @@ async def background_autopyar(bot: Bot):
                     active_chats.append(chat_id)
                     await asyncio.sleep(0.3)
                 except Exception:
-                    # Если бота кикнули из чата
                     pass
             
             if len(active_chats) != len(db["chats"]):
@@ -328,10 +321,9 @@ async def background_autopyar(bot: Bot):
         except Exception as e:
             logging.error(f"Ошибка автопиара: {e}")
 
-# Веб-сервер для Render (чтобы хостинг не усыплял бота)
 async def web_server():
     app = web.Application()
-    app.router.add_get("/", lambda req: web.Response(text="Telegram Bot is running 24/7!"))
+    app.router.add_get("/", lambda req: web.Response(text="Bot is running!"))
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 5000))
@@ -343,11 +335,10 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Запускаем веб-сервер для Render и фоновый автопиар параллельно с ботом
     asyncio.create_task(web_server())
     asyncio.create_task(background_autopyar(bot))
 
-    print("🤖 Telegram бот успешно запущен!")
+    print("🤖 Бот успешно запущен и готов к работе!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
